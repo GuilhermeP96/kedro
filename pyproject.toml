@@ -49,6 +49,8 @@ classifiers = [
 dynamic = ["readme", "version"]
 
 [project.optional-dependencies]
+adaptive = ["psutil>=5.9", "pyaccelerate>=0.11.0,<1.0"]
+acceleration-benchmark = ["kedro[adaptive]", "numpy>=1.26", "threadpoolctl>=3", "scikit-learn>=1.3", "openpyxl>=3.1"]
 test = [
     "behave>=1.2.6,<2.0",
     "coverage[toml]",

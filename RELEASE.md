@@ -2,6 +2,8 @@
 
 ## Major features and improvements
 
+- Bound concurrent runner submissions to the worker ceiling and avoid repeated pending-node and pipeline-boundary scans. Added an opt-in resource-aware thread runner and optional data/model acceleration helpers.
+
 - Added `kedro.inspection.validate_deployment_grouping` to check a node grouping before deployment. It reports datasets kept in memory that are passed between groups, cycles between groups, and datasets passed between groups on local disk.
 
 ## Bug fixes and other changes

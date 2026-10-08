@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 from abc import ABC, abstractmethod
-from collections import Counter, deque
+from collections import Counter, defaultdict, deque
 from concurrent.futures import (
     FIRST_COMPLETED,
     Executor,
@@ -194,8 +194,16 @@ class AbstractRunner(ABC):
         """Abstract method to provide the correct executor (e.g., ThreadPoolExecutor, ProcessPoolExecutor or None if running sequentially)."""
         pass
 
+    def _get_submission_limit(self, max_workers: int) -> int:
+        """Bound in-flight tasks; resource-aware runners may lower this ceiling."""
+        return max_workers
+
+    def _wait_for_resources(self) -> None:
+        """Called when admission is paused and no tasks are in flight."""
+        raise RuntimeError("Task admission paused without a resource wait policy")
+
     @abstractmethod  # pragma: no cover
-    def _run(
+    def _run(  # noqa: PLR0912, PLR0915 - shared sequential/parallel scheduling lifecycle
         self,
         pipeline: Pipeline,
         catalog: CatalogProtocol | SharedMemoryCatalogProtocol,
@@ -220,6 +228,7 @@ class AbstractRunner(ABC):
         self._set_manager_datasets(catalog)
 
         load_counts = Counter(chain.from_iterable(n.inputs for n in pipeline.nodes))
+        boundaries = (pipeline.inputs(), pipeline.outputs())
         node_dependencies = pipeline.node_dependencies
         todo_nodes = set(node_dependencies.keys())
         done_nodes: set[Node] = set()
@@ -246,15 +255,27 @@ class AbstractRunner(ABC):
                 self._logger.info(
                     "Completed %d out of %d tasks", len(done_nodes), len(nodes)
                 )
-                self._release_datasets(node, catalog, load_counts, pipeline)
+                self._release_datasets(node, catalog, load_counts, pipeline, boundaries)
 
             return  # Exit early since everything runs sequentially
 
         with pool as executor:
-            while True:
-                ready = {n for n in todo_nodes if node_dependencies[n] <= done_nodes}
-                todo_nodes -= ready
-                for node in ready:
+            # Visit each edge once instead of scanning every pending node on
+            # every completion. Keep ready nodes outside the executor queue so
+            # resource admission can change before the next submission.
+            remaining = {n: len(deps) for n, deps in node_dependencies.items()}
+            successors = defaultdict(list)
+            for child, parents in node_dependencies.items():
+                for parent in parents:
+                    successors[parent].append(child)
+            ready = deque(n for n in nodes if remaining[n] == 0)
+            while todo_nodes or futures:
+                limit = max(
+                    0, min(max_workers, self._get_submission_limit(max_workers))
+                )
+                while ready and len(futures) < limit:
+                    node = ready.popleft()
+                    todo_nodes.remove(node)
                     task = Task(
                         node=node,
                         catalog=catalog,
@@ -266,14 +287,21 @@ class AbstractRunner(ABC):
                         task.parallel = True
                     futures.add(executor.submit(task))
                 if not futures:
+                    if ready:
+                        self._wait_for_resources()
+                        continue
                     if todo_nodes:
-                        self._raise_runtime_error(todo_nodes, done_nodes, ready, done)
+                        self._raise_runtime_error(
+                            todo_nodes, done_nodes, set(ready), done
+                        )
                     break
                 done, futures = wait(futures, return_when=FIRST_COMPLETED)
                 for future in done:
                     try:
                         node = future.result()
                     except Exception:
+                        for pending in futures:
+                            pending.cancel()
                         self._suggest_resume_scenario(pipeline, done_nodes, catalog)
                         raise
                     done_nodes.add(node)
@@ -281,7 +309,13 @@ class AbstractRunner(ABC):
                     self._logger.info(
                         "Completed %d out of %d tasks", len(done_nodes), len(nodes)
                     )
-                    self._release_datasets(node, catalog, load_counts, pipeline)
+                    self._release_datasets(
+                        node, catalog, load_counts, pipeline, boundaries
+                    )
+                    for child in successors[node]:
+                        remaining[child] -= 1
+                        if remaining[child] == 0:
+                            ready.append(child)
 
     @staticmethod
     def _raise_runtime_error(
@@ -349,14 +383,16 @@ class AbstractRunner(ABC):
         catalog: CatalogProtocol | SharedMemoryCatalogProtocol,
         load_counts: dict,
         pipeline: Pipeline,
+        boundaries: tuple[set[str], set[str]] | None = None,
     ) -> None:
         """Decrement dataset load counts and release any datasets we've finished with"""
+        inputs, outputs = boundaries or (pipeline.inputs(), pipeline.outputs())
         for dataset in node.inputs:
             load_counts[dataset] -= 1
-            if load_counts[dataset] < 1 and dataset not in pipeline.inputs():
+            if load_counts[dataset] < 1 and dataset not in inputs:
                 catalog.release(dataset)
         for dataset in node.outputs:
-            if load_counts[dataset] < 1 and dataset not in pipeline.outputs():
+            if load_counts[dataset] < 1 and dataset not in outputs:
                 catalog.release(dataset)
 
     def _validate_catalog(
